@@ -180,8 +180,8 @@ public class RpcCallHandler extends SimpleChannelInboundHandler<A6Request> {
 
         PluginFilterChain chain = conf.getChain();
 
-        // here we pre-read parameters in the resp to
-        // prevent confusion over the read/write index of the resp.
+        // Cache response fields before fetching extra info, since PayloadDecoder
+        // releases the backing ByteBuf when the current read completes.
         preReadPostReq();
 
         if (Objects.isNull(chain) || 0 == chain.getFilters().size()) {

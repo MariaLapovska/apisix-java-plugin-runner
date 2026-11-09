@@ -58,6 +58,12 @@ public class PostReqWithVarsFilter implements PluginFilter {
         assert body.get("url").toString().endsWith((String) conf.get("rewrite_path"));
         String serverPort = request.getVars("server_port");
         response.setHeader("server_port", serverPort);
+        response.setHeader("X-Upstream-Status-Code", request.getUpstreamStatusCode().toString());
+        for (Map.Entry<String, String> header : request.getUpstreamHeaders().entrySet()) {
+            if ("Content-Type".equalsIgnoreCase(header.getKey())) {
+                response.setHeader("X-Upstream-Content-Type", header.getValue());
+            }
+        }
         chain.postFilter(request, response);
     }
 

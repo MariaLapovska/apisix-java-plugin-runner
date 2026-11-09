@@ -70,7 +70,9 @@ var _ = ginkgo.Describe("Post", func() {
 			Method: http.MethodGet,
 			Path:   "/test/java/runner/postvars",
 			ExpectHeaders: map[string]string{
-				"server-port": "9080",
+				"server-port":             "9080",
+				"X-Upstream-Status-Code":  "200",
+				"X-Upstream-Content-Type": "application/json; charset=utf-8",
 			},
 			ExpectStatus: http.StatusOK,
 		}),

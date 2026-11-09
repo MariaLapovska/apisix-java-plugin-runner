@@ -21,11 +21,14 @@ import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.flatbuffers.FlatBufferBuilder;
 import io.github.api7.A6.TextEntry;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.apache.apisix.plugin.runner.A6Conf;
 import org.apache.apisix.plugin.runner.A6ConfigRequest;
 import org.apache.apisix.plugin.runner.A6ConfigResponse;
 import org.apache.apisix.plugin.runner.A6ConfigWatcher;
+import org.apache.apisix.plugin.runner.ExtraInfoRequest;
 import org.apache.apisix.plugin.runner.PostRequest;
 import org.apache.apisix.plugin.runner.PostResponse;
 import org.apache.apisix.plugin.runner.filter.PluginFilter;
@@ -35,10 +38,16 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -151,5 +160,85 @@ public class PostFilterTest {
         Assertions.assertTrue(bytes.toString().contains("do post filter: UpStreamFilter, upstreamStatusCode: 418"));
         Assertions.assertTrue(bytes.toString().contains("do post filter: UpStreamFilter, upstreamHeader key: headerKey"));
         Assertions.assertTrue(bytes.toString().contains("do post filter: UpStreamFilter, upstreamHeader value: headerValue"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    @DisplayName("test upstream fields survive buffer release before extra info returns")
+    void doPostFilterAfterBufferRelease(boolean responseBody) {
+        PluginFilter filter = new PluginFilter() {
+            @Override
+            public String name() {
+                return "UpstreamFilter";
+            }
+
+            @Override
+            public List<String> requiredVars() {
+                return responseBody ? null : Collections.singletonList("server_port");
+            }
+
+            @Override
+            public Boolean requiredRespBody() {
+                return responseBody;
+            }
+
+            @Override
+            public void postFilter(PostRequest request, PostResponse response, PluginFilterChain chain) {
+                Assertions.assertEquals(Collections.singletonMap("x-upstream", "original"), request.getUpstreamHeaders());
+                Assertions.assertEquals(418, request.getUpstreamStatusCode());
+                Assertions.assertEquals(8888L, request.getRequestId());
+                if (responseBody) {
+                    Assertions.assertEquals("upstream-body", request.getBody());
+                } else {
+                    Assertions.assertEquals("9080", request.getVars("server_port"));
+                }
+                chain.postFilter(request, response);
+            }
+        };
+        cache.put(confToken, new A6Conf(Collections.emptyMap(),
+                new PluginFilterChain(Collections.singletonList(filter))));
+
+        FlatBufferBuilder builder = new FlatBufferBuilder();
+        int header = TextEntry.createTextEntry(builder,
+                builder.createString("x-upstream"), builder.createString("original"));
+        int headers = io.github.api7.A6.HTTPRespCall.Req.createHeadersVector(builder, new int[]{header});
+        io.github.api7.A6.HTTPRespCall.Req.startReq(builder);
+        io.github.api7.A6.HTTPRespCall.Req.addId(builder, 8888L);
+        io.github.api7.A6.HTTPRespCall.Req.addConfToken(builder, confToken);
+        io.github.api7.A6.HTTPRespCall.Req.addStatus(builder, 418);
+        io.github.api7.A6.HTTPRespCall.Req.addHeaders(builder, headers);
+        builder.finish(io.github.api7.A6.HTTPRespCall.Req.endReq(builder));
+        byte[] frame = frame((byte) 4, builder.dataBuffer());
+        ByteBuf input = Unpooled.wrappedBuffer(frame);
+
+        EmbeddedChannel postChannel = new EmbeddedChannel(new BinaryProtocolDecoder(),
+                new PayloadDecoder(), new RpcCallHandler(cache));
+        try {
+            postChannel.writeInbound(input);
+            Assertions.assertEquals(0, input.refCnt());
+            Assertions.assertTrue(postChannel.readOutbound() instanceof ExtraInfoRequest);
+            Assertions.assertNull(postChannel.readOutbound());
+
+            // Deterministically simulate reuse of the released frame's backing memory.
+            Arrays.fill(frame, (byte) 0);
+
+            builder = new FlatBufferBuilder();
+            int result = io.github.api7.A6.ExtraInfo.Resp.createResultVector(builder,
+                    (responseBody ? "upstream-body" : "9080").getBytes(StandardCharsets.UTF_8));
+            builder.finish(io.github.api7.A6.ExtraInfo.Resp.createResp(builder, result));
+            postChannel.writeInbound(Unpooled.wrappedBuffer(frame((byte) 3, builder.dataBuffer())));
+
+            Assertions.assertTrue(postChannel.readOutbound() instanceof PostResponse);
+            Assertions.assertNull(postChannel.readOutbound());
+        } finally {
+            postChannel.finishAndReleaseAll();
+        }
+    }
+
+    private byte[] frame(byte type, ByteBuffer payload) {
+        int length = payload.remaining();
+        return ByteBuffer.allocate(length + 4).put(type)
+                .put((byte) (length >> 16)).put((byte) (length >> 8)).put((byte) length)
+                .put(payload).array();
     }
 }
